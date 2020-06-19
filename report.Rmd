@@ -1,0 +1,275 @@
+---
+title: "对Spotify数据集的分析"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    extra_dependencies:
+      ctexcap: UTF8
+---
+
+```{r include = FALSE}
+knitr::opts_chunk$set(echo=FALSE)
+```
+
+## 目的
+目的是更好地预测一首歌是否被此人喜欢。有2个目标：
+1. 作出更准确的分类，为此，用LDA,QDA进行分类
+2. 使分类标准更加易于解释。为此，试图用PCA和因子分析降维可视化。由于这些歌曲没有类别信息，做一下聚类分析和因子分析，用k-means方法，看一下做出来的类别是否与喜好^[为了叙述方便，把这个人称为A]有明显的关系。
+
+### 数据的含义
+- acousticness^[acoustic: Of a musical instrument, gramophone, etc.: not electrically amplified.]，未被电子放大，接近1表示没有放大。
+- energy:无需解释，同样在0到1之间。
+- instrumentalness：越接近1，表示人声越少。
+- key：因子变量，c#这样。
+- liveness：越接近1，表示现场版的可能性越大，如果>0.8则很有可能是现场版。
+- loudness：用db刻画。
+- mode：因子变量，大调还是小调。
+- speechiness：越接近1表示音乐越少，说得越多，类似于talk show和演讲等。0.33-0.66就是有说又有音乐，比如rap。
+- tempo：BPM,每分钟有几小节。
+- time_signatures：每小节有几拍。
+- valence：悲哀程度，如果比较高，那么比较积极欢快，否则消极(抑郁、生气、悲伤)。
+
+
+## EDA
+由于歌手众多(1600多个不同歌手)，作为因子，意义很小，而运算量却非常大，非常明显地影响运行速度，因此在后面单独分析常见歌手。其它类别变量转换为因子。对数据做标准化，因为尺度不一，比如，duration_ms远大于其它量。
+
+```{r}
+rm(list=ls())
+setwd('/Users/quebec/Playground/AMSA/project/')
+```
+
+```{r 数据,message=FALSE}
+#所需要的包
+pacman::p_boot()
+pacman::p_load(MASS,energy,dplyr,stats,graphics,alr3,Hmisc,ggplot2,psych,car,codetools)
+.d<-read.csv('data.csv',header = TRUE,stringsAsFactors = FALSE)
+row.names(.d)<-.d$X
+.d$X<-NULL
+# refactor key, mode and target
+key_labs = c('c', 'c#', 'd', 'd#', 'e', 'f', 
+             'f#', 'g', 'g#', 'a', 'a#', 'b')
+mode_labs = c('minor', 'major')
+target_labs = c('dislike', 'like')
+.d_ana<-transform(.d,key=factor(key,labels = key_labs),mode = factor(mode, labels = mode_labs),target = factor(target, labels = target_labs),time_signature=factor(.d$time_signature),artist=NULL,song_title=NULL)
+factor_index<-which(unlist(lapply(.d_ana,class))=="factor") #因子类型的列索引#.d_ana用于后续分析
+.d_ana<-.d_ana %>% mutate_at(-factor_index, ~(scale(.) %>% as.vector)) #标准化
+#.d_ana.num的区别是没有转换为因子，全部都为numeric类型，其它相同
+.d_ana.num<-transform(.d,artist=NULL,song_title=NULL)
+.d_ana.num<-.d_ana.num%>% mutate_at(-factor_index, ~(scale(.) %>% as.vector)) #标准化
+```
+
+### 数据的总体描述
+```{r}
+ggplot(stack(subset(.d_ana,target=="like",select=-factor_index)),aes(x=ind,y=values))+geom_boxplot()+theme(axis.text.x=element_text(angle=45,hjust=1,vjust=0.5))
+```
+```{r}
+ggplot(stack(subset(.d_ana,target=="dislike",select=-factor_index)),aes(x=ind,y=values))+geom_boxplot()+theme(axis.text.x=element_text(angle=45,hjust=1,vjust=0.5))
+```
+
+观察like与dislike前后的偏移，发现的明显区别是：danceability的下移，从均值>0变为均值<0，说明A更喜欢比较律动的歌曲，duration_ms也有所下移，说明更厌恶时长偏短一些的，loudness有明显上升，说明不喜欢更吵的歌曲，valence下移，说明A不喜欢偏消极的歌曲。以上都只是倾向，并不是准则。我们据此得到一个更重要变量的索引。tempo和liveness并不重要，影响很小。
+```{r}
+key_index<-c(1,2,4,5,8,10)
+```
+
+
+### 变量的相关性
+```{r}
+corrplot::corrplot(cor(.d_ana.num))
+```
+
+由图，多数变量之间的相关性很弱，比较强的相关性主要存在于energy,loudness,acousticness之间，以及valence与danceability，这符合常识。但总体来说，数据的相关性偏弱，使人怀疑做PCA、因子分析、LDA这些基于线性的方法效果可能不会很好。
+
+### 喜欢和不喜欢的歌手
+```{r}
+top_thresh <-7
+top_artist<-names(table(.d$artist)[table(.d$artist)>top_thresh])
+#length(top_artist)
+top_artist.set<-subset(.d,artist %in% top_artist,select=c(artist,target))
+#sink("output0.txt") Rmd中sink不起作用
+(top_artist.tab<-with(top_artist.set,table(artist,target)))
+#sink()
+```
+
+通过尝试性地调整top_thresh，希望能控制artist的数量，确定thresh>=8次以上，这样有16个歌手^[由于thresh固定，CHVRCHES(喜欢),The Chainsmokers(不喜欢),Young Thug(喜欢)出现7次，也算高频，但没有入选]。
+
+虽然不一定能全面反映A的喜好，但也能得到他最喜欢和最不喜欢的一些artist。
+- 最不喜欢的：*NSYNC,Backstreet Boys,Big Time Rush,Demi Lovato,Fall Out Boy,Kina Grannis,Skrillex,WALK THE MOON
+- 最喜欢的：Crystal Castles,Disclosure,FIDLAR,Kanye West,Michael Jackson
+这两个名单的特点是，全不喜欢或者全是喜欢。
+Drake出现次数为最高，喜欢和不喜欢分别是10和3，还是偏向于喜欢的，Future也如此。Rick Ross则相反，分别是9和4，偏向于不喜欢。
+
+## 尝试降维可视化
+由于变量个数太多，不易解释，考虑降维。
+
+### PCA
+```{r}
+par(mfrow=c(1,2))
+pca <- princomp(.d_ana.num[-14],scores = TRUE,cor = TRUE)
+#(pca$sdev^2)
+plot((pca$sdev^2),type="b")
+sum((pca$sdev^2)[1:7])/sum((pca$sdev^2))
+plot(x=pca$scores[,1],y=pca$scores[,2],col=.d_ana$target,ann=F)
+```
+
+PCA的降维效果不怎么好，从这幅图来看，至少应该保留7个主成分，而且就算是7个，也只解释了74.7%的方差，二维可视化可以不用想了，不过还是做做看，事实上也的确如此，混杂在一起，无法分开，不过也还是有一些特点，在PC1和PC2比较大的时候(靠近图的右上角)，不喜欢的比例高很多。这符合常识，被喜欢的一般不会太极端。
+
+如果drop一些变量，对方差解释度会提高，这在预期之内，但对分类无济于事。
+
+#### 因子分析
+做因子分析，同样在只有2个变量时，解释度很低
+
+```{r}
+fit <- principal(.d_ana.num[-c(14)], nfactors=2, rotate="none",scores = TRUE,main="PCA")
+sum(fit$communality)/sum(fit$communality+fit$uniquenesses)
+```
+
+解释度如此低，我猜测与因子有关，在去除因子变量后(6,9,12)，也没有提高多少(33.6%%从42.7%)，与相关性比较差有关。
+
+```{r}
+plot(x=fit$scores[,1],y=fit$scores[,2],col=.d_ana$target,ann=F,main="FA")
+```
+
+有着类似的效果，因子得分与类别完全混在一起。去除变量后也类似，不再多说。
+
+## 分类
+```{r}
+ cross_validation <- function(full_data,col, kfolds, model_type=c("lda","qda"),cor=FALSE,seed=17) {
+   set.seed(seed)
+    #col表示的是，哪一列是要预测的，在.d_ana中是14
+    ## Define fold_ids in exactly the same way as before
+    fold_ids      <- rep(seq(kfolds), 
+                         ceiling(nrow(full_data) / kfolds))
+    #就是这样1,2,3,4,5这样子
+    fold_ids      <- fold_ids[1:nrow(full_data)] #这里是在截取等长
+    fold_ids      <- sample(fold_ids, length(fold_ids)) #置乱
+    
+    ## Initialize a vector to store CV error
+    CV_error_vec  <- vector(length = kfolds, mode = "numeric") #每一次的错误率
+    
+    # if(cor==TRUE) {
+    #   full_data<-lapply(full_data,scale.continuous)
+    # }
+      
+    ## Loop through the folds
+    for (k in 1:kfolds){
+      if (model_type == "qda") {
+        qda_model         <- qda(full_data[which(fold_ids != k),-col], 
+                                 full_data[which(fold_ids != k),col])
+        qda_pred          <- predict(qda_model, 
+                                     full_data[which(fold_ids == k),-col])
+        class_pred        <- qda_pred$class
+        
+      } else if (model_type == "lda") {
+        lda_model         <- lda(full_data[which(fold_ids != k),-col], 
+                                 full_data[which(fold_ids != k),col])
+        lda_pred          <- predict(lda_model, 
+                                     full_data[which(fold_ids == k),-col])
+        class_pred        <- lda_pred$class
+        
+      } ## Add a QDA option to this code here:
+      
+      CV_error_vec[k]     <- mean(class_pred != full_data[which(fold_ids == k),col])
+    }
+    return(CV_error_vec)
+  }
+```
+
+### LDA
+10折交叉验证的结果为如下，错误率很高
+```{r}
+mean(cross_validation(.d_ana.num,col=14,kfolds = 10,model_type = "lda"))
+#已在函数中置乱，无需再置乱
+```
+
+### QDA
+用qda，错误率有所降低，不过还是很高
+```{r}
+mean(cross_validation(.d_ana.num,col=14,kfolds = 10,model_type = "qda"))
+```
+
+### 正态性如何？
+```{r}
+mx<-colMeans(.d_ana.num)
+S<-cov(.d_ana.num)
+f<-function(i) {
+row_i<-data.matrix((.d_ana.num[i,]-mx))
+return (row_i%*%solve(S)%*%t(row_i))}
+n<-nrow(.d_ana.num)
+q=vector(mode = "numeric",length = n)
+for(i in 1:n) q[i]=f(i)
+plot(qchisq((1:n-0.5)/n,df=ncol(.d_ana.num)),sort(q),ann=F)
+```
+
+并不接近直线，完全是曲线，正态性是不满足的，何况这只是一个并不全面的检验。用R提供的一个多元正态性的检验。p值很高，与正态性完全不沾边。而QDA对正态性是敏感的，但它效果能好于LDA，原因大概是：LDA太差了。也说明了线性判别在这里并不是好的做法。
+```{r}
+mvnorm.etest(.d_ana.num)
+```
+
+
+## 聚类
+聚类是无监督的方法，一般我认为它的效果是不如LDA的。但是由于线性方法在这里效果并不很好，它是非线性的，所以我觉得它可能会有更好的表现。
+
+### 分为几类
+```{r}
+wss <- function(data, maxCluster = 9) {
+    SSw <- vector()
+    for (i in 2:maxCluster) {
+        SSw[i-1] <- sum(kmeans(data, centers = i)$withinss)
+    }
+    plot(2:maxCluster, SSw, type = "o", xlab = "Number of Clusters", ylab = "Within groups sum of squares", pch=19)
+}
+wss(.d_ana.num)
+```
+
+由elbow method，分成4类是合适的。
+
+### 2类
+先看看2类的情况，看看能否有助于like/dislike的分类。
+```{r}
+clu.2<-kmeans(.d_ana.num, centers = 2)
+table(clu.2$clu,.d_ana.num$target)
+```
+
+参考价值很小，因为第2类的数目比第1类要多得多，无论是喜欢还是不喜欢。
+如果尝试drop一些变量，也同样如此
+```{r}
+clu.2<-kmeans(.d_ana.num[key_index], centers = 2)
+# clu<-kmeans(.d_ana.num[c(1,2,4,8,13)], centers = 2)
+table(clu.2$clu,.d_ana.num$target)
+```
+
+### 4类
+划分为4类
+```{r}
+#clu<-kmeans(.d_ana.num, centers = 5)
+#clu<-kmeans(.d_ana.num[c(1,2,4,5,7,8,10,13)], centers = 5)
+clu.4<-kmeans(.d_ana.num[key_index], centers = 4)
+table(clu.4$clu,.d_ana.num$target)
+```
+从分类的角度，没什么收获，因为没有表现出非常显著、足以决定分类的差异。第1类和第4类的比例对0,1差不太多，2大致为1:2，也不算悬殊，第3组有比较明显的差别，约3:1，但也不是决定性的。
+
+### 与歌手对比
+关于分类的合理性，在认知中，同一歌手的风格应该相似
+
+```{r}
+#sink("output1.txt",append = TRUE)
+table(clu.2$clu[as.numeric(rownames(top_artist.set))+1],top_artist.set$artist)
+#sink()
+```
+
+在2分类的结果下，几乎全部判别为同一种类型，不过在前面可以看到，本来第1类的数目远小于第2类的数目。要判断聚类，不妨选类数最多的，我们期待的效果是，虽然有5类，但是能集中在1-2类中，以下是5类的情况。
+
+```{r}
+clu.5<-kmeans(.d_ana.num[key_index], centers = 4)
+#sink("output1.txt",append = TRUE)
+table(clu.5$clu[as.numeric(rownames(top_artist.set))+1],top_artist.set$artist)
+#sink()
+```
+
+在这一点上，确实满足了期待。
+
+
+## 总结
+线性方法在这里效果都不好。分类预测效果很差。去网上搜更多的结果，效果最好的是random forest(80%-83%的正确率)之类的非线性方法。LDA,QDA普遍只有68%-73%的正确率，其它的线性方法比如logistic regression，效果也不佳。说明线性方法是很有局限性的。如果LDA解决不了，也就不能指望PCA和因子分析能够提高分类效果，更好地解释结果。它们都是线性方法。一度试图用聚类分析解决，因为它不是线性方法，但效果更差，无监督还是不能与有监督的相比。不过聚类并不是完全没有意义，至少高频的artist的类型主要集中在1类或者2类中(5类时)。
+
+这个过程中让我苦恼的就是factor类型变量，也就是类别变量。之前学习这些方法时，忽略了这样的变量的存在。现在的处理是转换成数值，这个处理很糟糕，因为它们并没有数值大小上的关系。想法是找到合适的变换，还需要进一步看看有没有这方面的结果。
